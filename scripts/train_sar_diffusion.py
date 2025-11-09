@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument(
+        "--angle_bin_size",
+        type=float,
+        default=None,
+        help="角度分箱的大小（单位：度），默认为 None 表示不分箱",
+    )
 
     # 模型参数
     parser.add_argument("--base_channels", type=int, default=128)
@@ -183,12 +189,26 @@ def main():
     accelerator.init_trackers("sar_diffusion")
     set_seed(args.seed)
 
+    resume_metadata_obj: Optional[SARDatasetMetadata] = None
+    if args.resume_from_checkpoint is not None and os.path.isfile(args.resume_from_checkpoint):
+        try:
+            resume_ckpt = torch.load(args.resume_from_checkpoint, map_location="cpu")
+            resume_meta_dict = resume_ckpt.get("metadata", {}).get("dataset")
+            if resume_meta_dict is not None:
+                resume_metadata_obj = SARDatasetMetadata.from_dict(resume_meta_dict)
+                if resume_metadata_obj.angle_bin_size is not None:
+                    args.angle_bin_size = resume_metadata_obj.angle_bin_size
+        except Exception as exc:
+            logger.warning(f"Failed to read metadata from checkpoint: {exc}")
+
     # 构建数据集
     train_dataset = SARDataset(
         args.train_data_dir,
         image_size=args.resolution,
         center_crop=args.center_crop,
         random_flip=args.random_flip,
+        metadata=resume_metadata_obj,
+        angle_bin_size=args.angle_bin_size,
     )
     train_metadata_obj = train_dataset.get_metadata()
     train_metadata = train_metadata_obj.to_dict()
@@ -204,6 +224,7 @@ def main():
             center_crop=args.center_crop,
             random_flip=False,
             metadata=train_metadata_obj,
+            angle_bin_size=args.angle_bin_size,
         )
 
     train_dataloader = create_dataloader(

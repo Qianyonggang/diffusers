@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 from pathlib import Path
 from typing import Dict
@@ -50,13 +51,45 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return model, dataset_meta
 
 
+def _angle_str_to_id(meta: SARDatasetMetadata, angle_value: str) -> int:
+    """根据 metadata 将角度字符串映射到 angle_id，支持 angle bin."""
+
+    if angle_value in meta.angle_to_id:
+        return meta.angle_to_id[angle_value]
+
+    if meta.angle_bin_size is None:
+        raise ValueError(
+            f"angle `{angle_value}` not in metadata; available: {list(meta.angle_to_id.keys())}"
+        )
+
+    try:
+        angle_float = float(angle_value)
+    except ValueError as exc:
+        raise ValueError(f"angle `{angle_value}` 无法转换为浮点数") from exc
+
+    bin_size = float(meta.angle_bin_size)
+    if bin_size <= 0:
+        raise ValueError("angle_bin_size must be positive in metadata")
+
+    num_bins = int(math.ceil(360.0 / bin_size))
+    angle_float = max(0.0, min(359.9999, angle_float))
+    bin_idx = int(angle_float // bin_size)
+    if bin_idx >= num_bins:
+        bin_idx = num_bins - 1
+
+    if bin_idx >= meta.num_angles:
+        raise ValueError(
+            f"angle `{angle_value}` 对应的 bin={bin_idx} 超出了模型训练时的嵌入范围 {meta.num_angles}"
+        )
+    return bin_idx
+
+
 def prepare_condition_tensors(meta: SARDatasetMetadata, args) -> Dict[str, torch.Tensor]:
     if args.class_name not in meta.class_to_id:
         raise ValueError(f"class_name `{args.class_name}` not found in metadata; available: {list(meta.class_to_id.keys())}")
 
     angle_key = str(args.angle)
-    if angle_key not in meta.angle_to_id:
-        raise ValueError(f"angle `{angle_key}` not in metadata; available: {list(meta.angle_to_id.keys())}")
+    angle_id_value = _angle_str_to_id(meta, angle_key)
 
     jam_a_key = str(args.jam_active)
     jam_p_key = str(args.jam_passive)
@@ -64,7 +97,7 @@ def prepare_condition_tensors(meta: SARDatasetMetadata, args) -> Dict[str, torch
         raise ValueError("jam_active or jam_passive value not found in metadata")
 
     class_ids = torch.full((args.num_samples,), meta.class_to_id[args.class_name], dtype=torch.long)
-    angle_ids = torch.full((args.num_samples,), meta.angle_to_id[angle_key], dtype=torch.long)
+    angle_ids = torch.full((args.num_samples,), angle_id_value, dtype=torch.long)
     jam_a_ids = torch.full((args.num_samples,), meta.jam_a_to_id[jam_a_key], dtype=torch.long)
     jam_p_ids = torch.full((args.num_samples,), meta.jam_p_to_id[jam_p_key], dtype=torch.long)
 

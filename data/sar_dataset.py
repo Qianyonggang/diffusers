@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ class SARDatasetMetadata:
     angle_to_id: Dict[str, int]
     jam_a_to_id: Dict[str, int]
     jam_p_to_id: Dict[str, int]
+    angle_bin_size: Optional[float] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -34,6 +36,7 @@ class SARDatasetMetadata:
             "angle_to_id": self.angle_to_id,
             "jam_a_to_id": self.jam_a_to_id,
             "jam_p_to_id": self.jam_p_to_id,
+            "angle_bin_size": self.angle_bin_size,
         }
 
     @classmethod
@@ -48,6 +51,7 @@ class SARDatasetMetadata:
             angle_to_id=dict(data["angle_to_id"]),
             jam_a_to_id=dict(data["jam_a_to_id"]),
             jam_p_to_id=dict(data["jam_p_to_id"]),
+            angle_bin_size=data.get("angle_bin_size"),
         )
 
 
@@ -66,6 +70,7 @@ class SARDataset(Dataset):
         center_crop: bool = True,
         random_flip: bool = False,
         metadata: Optional[SARDatasetMetadata] = None,
+        angle_bin_size: Optional[float] = None,
     ) -> None:
         super().__init__()
         if not os.path.isdir(root_dir):
@@ -93,17 +98,40 @@ class SARDataset(Dataset):
             self.angle_to_id = dict(metadata.angle_to_id)
             self.jam_a_to_id = dict(metadata.jam_a_to_id)
             self.jam_p_to_id = dict(metadata.jam_p_to_id)
+            if metadata.angle_bin_size is not None:
+                self.angle_bin_size = float(metadata.angle_bin_size)
+            else:
+                self.angle_bin_size = float(angle_bin_size) if angle_bin_size is not None else None
         else:
             classes, angles, jam_as, jam_ps = self._scan_labels(self.image_paths)
             self.class_to_id = {name: idx for idx, name in enumerate(sorted(classes))}
-            # 角度这里默认按照数值排序；若无法转成 float，则回退到字符串排序
-            try:
-                sorted_angles = sorted(angles, key=lambda v: float(v))
-            except ValueError:
-                sorted_angles = sorted(angles)
-            self.angle_to_id = {name: idx for idx, name in enumerate(sorted_angles)}
+            if angle_bin_size is not None:
+                if angle_bin_size <= 0:
+                    raise ValueError("angle_bin_size must be a positive number")
+                self.angle_bin_size = float(angle_bin_size)
+                num_bins = int(math.ceil(360.0 / self.angle_bin_size))
+                self.angle_to_id = {}
+                for name in angles:
+                    bin_idx = self._angle_to_bin(name, num_bins)
+                    self.angle_to_id[name] = bin_idx
+            else:
+                self.angle_bin_size = None
+                # 角度这里默认按照数值排序；若无法转成 float，则回退到字符串排序
+                try:
+                    sorted_angles = sorted(angles, key=lambda v: float(v))
+                except ValueError:
+                    sorted_angles = sorted(angles)
+                self.angle_to_id = {name: idx for idx, name in enumerate(sorted_angles)}
             self.jam_a_to_id = {name: idx for idx, name in enumerate(sorted(jam_as))}
             self.jam_p_to_id = {name: idx for idx, name in enumerate(sorted(jam_ps))}
+
+        if metadata is None and angle_bin_size is None:
+            self.angle_bin_size = None
+        elif metadata is None and angle_bin_size is not None:
+            # 已在上面赋值
+            pass
+        elif metadata is not None and metadata.angle_bin_size is None:
+            self.angle_bin_size = float(angle_bin_size) if angle_bin_size is not None else None
 
         self.id_to_class = {idx: name for name, idx in self.class_to_id.items()}
         self.id_to_angle = {idx: name for name, idx in self.angle_to_id.items()}
@@ -111,7 +139,10 @@ class SARDataset(Dataset):
         self.id_to_jam_p = {idx: name for name, idx in self.jam_p_to_id.items()}
 
         self.num_classes = len(self.class_to_id)
-        self.num_angles = len(self.angle_to_id)
+        if self.angle_bin_size is not None:
+            self.num_angles = max(self.angle_to_id.values()) + 1 if self.angle_to_id else 0
+        else:
+            self.num_angles = len(self.angle_to_id)
         self.num_jam_a = len(self.jam_a_to_id)
         self.num_jam_p = len(self.jam_p_to_id)
 
@@ -170,7 +201,16 @@ class SARDataset(Dataset):
         pixel_values = image * 2.0 - 1.0
 
         class_id = self.class_to_id[class_name]
-        angle_id = self.angle_to_id[angle]
+        if angle in self.angle_to_id:
+            angle_id = self.angle_to_id[angle]
+        elif self.angle_bin_size is not None:
+            # 对 eval 集中未出现过的新角度，根据相同的 bin 规则进行量化
+            num_bins = int(math.ceil(360.0 / self.angle_bin_size))
+            angle_id = self._angle_to_bin(angle, num_bins)
+            self.angle_to_id[angle] = angle_id
+            self.id_to_angle[angle_id] = angle
+        else:
+            raise KeyError(f"angle `{angle}` not found in dataset mapping")
         jam_a_id = self.jam_a_to_id[jam_a]
         jam_p_id = self.jam_p_to_id[jam_p]
 
@@ -193,7 +233,25 @@ class SARDataset(Dataset):
             angle_to_id=self.angle_to_id,
             jam_a_to_id=self.jam_a_to_id,
             jam_p_to_id=self.jam_p_to_id,
+            angle_bin_size=self.angle_bin_size,
         )
+
+    def _angle_to_bin(self, angle_name: str, num_bins: int) -> int:
+        """将角度字符串映射到等宽分箱后的 bin index。"""
+
+        try:
+            angle_value = float(angle_name)
+        except ValueError:
+            raise ValueError(
+                "angle_bin_size 模式下要求角度能够转成 float, 当前角度无法解析: "
+                f"{angle_name}"
+            )
+        # clip 到 [0, 360)
+        angle_value = max(0.0, min(359.9999, angle_value))
+        bin_idx = int(angle_value // self.angle_bin_size)
+        if bin_idx >= num_bins:
+            bin_idx = num_bins - 1
+        return bin_idx
 
     def save_metadata(self, output_path: str) -> None:
         with open(output_path, "w", encoding="utf-8") as f:
